@@ -243,6 +243,7 @@ from litellm.utils import (
     get_secret,
     get_utc_datetime,
     is_region_allowed,
+    provider_rejectable_params,
     set_live_deployment_replay,
 )
 
@@ -10832,6 +10833,61 @@ class Router:
         }
         return {**deployment, "model_info": model_info}  # mutable-ok: DeploymentTypedDict rows are plain dicts
 
+    TIER_PARAMS_NEVER_DROPPED: Final = frozenset({"extra_headers"})
+
+    @staticmethod
+    def _deployment_accepts_param(deployment: DeploymentTypedDict, group: str, param: str) -> bool:
+        deployment_params: Final = deployment.get("litellm_params")
+        if not deployment_params:
+            return True
+        try:
+            model, custom_llm_provider, _, _ = litellm.get_llm_provider(
+                model=deployment_params.get("model") or group,
+                custom_llm_provider=deployment_params.get("custom_llm_provider"),
+            )
+            supported: Final = litellm.get_supported_openai_params(model=model, custom_llm_provider=custom_llm_provider)
+        except Exception as e:  # noqa: BLE001  # best-effort filter: an unresolvable provider must not narrow the request
+            verbose_router_logger.debug(
+                "litellm.router.py::_deployment_accepts_param: keeping %s for model=%s. Got - %s", param, group, e
+            )
+            return True
+        return supported is None or param in supported
+
+    def _tier_params_the_target_accepts(self, model: str, tier_params: Mapping[str, object]) -> Mapping[str, object]:
+        """Drop an OpenAI param that no deployment behind ``model`` declares.
+
+        A tier's litellm_params are an operator override applied to every request the tier routes,
+        so one the target cannot take turns that whole tier into a 400 raised before the request
+        leaves the proxy. The candidates are exactly what get_optional_params can reject, asked of
+        the module that raises, so credentials and endpoint controls are never at risk.
+
+        extra_headers is excluded on top of that. This filter trades a param for a working request,
+        which is the right trade for one that only shapes how the model answers, and the wrong one
+        for headers: those carry auth, tenancy and routing information, so silently sending fewer of
+        them than the operator configured is worse than the error they get today.
+
+        A param survives if ANY deployment could take it, because routing has not chosen one yet,
+        and it survives both an unresolvable provider and a group with no deployments, because a
+        best-effort filter must never narrow what the request already did.
+        """
+        deployments: Final = self.get_model_list(model_name=model) or ()
+        if not deployments:
+            return tier_params
+        candidates: Final = provider_rejectable_params(tier_params) - self.TIER_PARAMS_NEVER_DROPPED
+        unsupported: Final = frozenset(
+            param
+            for param in candidates
+            if not any(self._deployment_accepts_param(deployment, model, param) for deployment in deployments)
+        )
+        if not unsupported:
+            return tier_params
+        verbose_router_logger.warning(
+            "litellm.router.py: dropping tier params %s for model=%s, no deployment behind it declares them",
+            ", ".join(sorted(unsupported)),
+            model,
+        )
+        return MappingProxyType({key: value for key, value in tier_params.items() if key not in unsupported})
+
     def get_model_list(
         self, model_name: str | None = None, team_id: str | None = None
     ) -> list[DeploymentTypedDict] | None:
@@ -11887,7 +11943,9 @@ class Router:
                 model = pre_routing_hook_response.model
                 messages = pre_routing_hook_response.messages
                 if pre_routing_hook_response.litellm_params:
-                    request_kwargs.update(pre_routing_hook_response.litellm_params)
+                    request_kwargs.update(
+                        self._tier_params_the_target_accepts(model, pre_routing_hook_response.litellm_params)
+                    )
             #########################################################
 
             # Resolve the strategy and logger AFTER the pre-routing hook, since
@@ -11998,7 +12056,9 @@ class Router:
                 model = pre_routing_hook_response.model
                 messages = pre_routing_hook_response.messages
                 if pre_routing_hook_response.litellm_params:
-                    request_kwargs.update(pre_routing_hook_response.litellm_params)
+                    request_kwargs.update(
+                        self._tier_params_the_target_accepts(model, pre_routing_hook_response.litellm_params)
+                    )
 
             # 2. Get healthy deployments
             healthy_deployments: Final = await self.async_get_healthy_deployments(
